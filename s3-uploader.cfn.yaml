@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Outputs:
+
+  APIendpoint:
+    Description: HTTP API endpoint URL
+    Value: !Sub 'https://${UploadApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+  S3UploadBucketName:
+    Description: S3 bucket for application uploads
+    Value: !Ref S3UploadBucket
+
+  S3UploadFrontendBucketName:
+    Description: S3 bucket for frontend files
+    Value: !Ref S3UploadFrontendBucket
+
+  WebsiteURL:
+    Value: !GetAtt 
+      - S3UploadFrontendBucket
+      - WebsiteURL
+    Description: URL for website
+
+Description: S3 Uploader
+
+Resources:
+
+  #
+  # API Gateway
+  #
+  UploadApiApiGatewayDefaultStage:
+    Type: 'AWS::ApiGatewayV2::Stage'
+    Properties:
+      ApiId: !Ref UploadApi
+      AutoDeploy: true
+      StageName: $default
+
+  UploadRequestFunctionUploadAssetAPIPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      FunctionName: !Ref UploadRequestFunction
+      SourceArn: !Sub 
+        - >-
+          arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/${__Stage__}/GET/uploads
+        - __Stage__: '*'
+          __ApiId__: !Ref UploadApi
+
+  #
+  # Lambda for S3 presigned urls
+  #
+  UploadRequestFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: UploadRequestFunctionRolePolicy0
+          PolicyDocument:
+            Statement:
+              - Action:
+                  - 's3:PutObject'
+                  - 's3:PutObjectAcl'
+                  - 's3:PutLifecycleConfiguration'
+                Resource:
+                  - !Sub 
+                    - 'arn:${AWS::Partition}:s3:::${bucketName}'
+                    - bucketName: !Ref S3UploadBucket
+                  - !Sub 
+                    - 'arn:${AWS::Partition}:s3:::${bucketName}/*'
+                    - bucketName: !Ref S3UploadBucket
+                Effect: Allow
+
+  UploadRequestFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code: .
+      MemorySize: 128
+      Environment:
+        Variables:
+          UploadBucket: !Ref S3UploadBucket
+      Handler: function-uploader.handler
+      Role: !GetAtt 
+        - UploadRequestFunctionRole
+        - Arn
+      Timeout: 3
+      Runtime: nodejs12.x
+
+  #
+  # Web Site Storage
+  #
+  S3UploadFrontendBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      AccessControl: PublicRead
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - HEAD
+            AllowedOrigins:
+              - '*'
+
+  S3UploadFrontendBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket:
+        Ref: S3UploadFrontendBucket
+      PolicyDocument:
+        Id: StaticSitePolicy
+        Statement:
+          - Sid: PublicReadForGetBucketObjects
+            Action:
+              - 's3:GetObject'
+            Effect: Allow
+            Resource:
+              'Fn::Join':
+                - ''
+                - - 'arn:aws:s3:::'
+                  - Ref: S3UploadFrontendBucket
+                  - /*
+            Principal: '*'
+
+  #
+  # Web Site Generate
+  #
+  UploadFrontendFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code: .
+      Handler: function-frontend-uploader.handler
+      Role: !GetAtt UploadFrontendFunctionRole.Arn
+      Runtime: python3.7
+
+  UploadFrontendResource:
+    Type: 'Custom::UploadFronted'
+    Properties:
+      ApiEndpoint: !Sub 'https://${UploadApi}.execute-api.${AWS::Region}.amazonaws.com'
+      SiteBucket: !Ref S3UploadFrontendBucket
+      IndexDocument: frontend/index.html
+      ErrorDocument: frontend/error.html
+      ServiceToken: !GetAtt UploadFrontendFunction.Arn
+
+  UploadFrontendFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                - s3:PutObject
+                - s3:PutObjectACL
+                - s3:DeleteObject
+                Resource: !Sub 'arn:aws:s3:::${S3UploadFrontendBucket}/*'
+
+  #
+  # File upload destination
+  #
+  S3UploadBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - HEAD
+            AllowedOrigins:
+              - '*'
+
+  UploadApi:
+    Type: 'AWS::ApiGatewayV2::Api'
+    Properties:
+      Body:
+        info:
+          version: '1.0'
+          title: !Ref 'AWS::StackName'
+        paths:
+          /uploads:
+            get:
+              x-amazon-apigateway-integration:
+                httpMethod: POST
+                type: aws_proxy
+                uri: !Sub >-
+                  arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadRequestFunction.Arn}/invocations
+                payloadFormatVersion: '2.0'
+              responses: {}
+        x-amazon-apigateway-cors:
+          allowHeaders:
+            - '*'
+          allowMethods:
+            - GET
+            - POST
+            - DELETE
+            - OPTIONS
+          allowOrigins:
+            - '*'
+        openapi: 3.0.1
